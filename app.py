@@ -1,11 +1,11 @@
 """
 app.py — Scanned PDF → Searchable OCR PDF  (Streamlit Cloud)
 Outputs: searchable PDF + optional split parts (by MB or by page count).
+Split parts are bundled into a single ZIP download.
 No JSON or TXT files are generated.
 """
 
-import os
-import math
+import zipfile
 from io import BytesIO
 from pathlib import Path
 
@@ -13,7 +13,6 @@ import fitz  # PyMuPDF
 import streamlit as st
 from PIL import Image, ImageOps
 import pytesseract
-from pytesseract import Output
 from pypdf import PdfReader, PdfWriter
 
 
@@ -26,43 +25,6 @@ st.set_page_config(
     page_icon="📄",
     layout="centered",
 )
-
-
-# ---------------------------------------------------------------------------
-# Helper: word grouping
-# ---------------------------------------------------------------------------
-
-def words_to_lines(words: list, y_tolerance: int = 12) -> list:
-    if not words:
-        return []
-
-    sorted_words = sorted(
-        words,
-        key=lambda w: (w["top"] + w["height"] / 2, w["left"]),
-    )
-
-    line_groups: list = []
-    for word in sorted_words:
-        cy = word["top"] + word["height"] / 2
-        placed = False
-        for group in line_groups:
-            if abs(cy - group["cy"]) <= y_tolerance:
-                n = len(group["words"])
-                group["cy"] = (group["cy"] * n + cy) / (n + 1)
-                group["words"].append(word)
-                placed = True
-                break
-        if not placed:
-            line_groups.append({"cy": cy, "words": [word]})
-
-    lines = []
-    for idx, group in enumerate(line_groups, 1):
-        lw = sorted(group["words"], key=lambda w: w["left"])
-        lines.append({
-            "line_no": idx,
-            "text": " ".join(w["text"] for w in lw),
-        })
-    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +158,19 @@ def split_by_mb(pdf_bytes: bytes, limit_mb: float) -> list[tuple[str, bytes]]:
 
 
 # ---------------------------------------------------------------------------
+# ZIP helper
+# ---------------------------------------------------------------------------
+
+def make_zip(stem: str, parts: list[tuple[str, bytes]]) -> bytes:
+    """Pack all (filename, pdf_bytes) parts into an in-memory ZIP archive."""
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for name, data in parts:
+            zf.writestr(f"{stem}_{name}", data)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
 
@@ -290,7 +265,7 @@ if uploaded:
             use_container_width=True,
         )
 
-        # ── Split + download parts ────────────────────────────────────────
+        # ── Split + ZIP download ──────────────────────────────────────────
         if split_mode != "No split":
             st.divider()
 
@@ -304,31 +279,37 @@ if uploaded:
                         )
                     else:
                         parts = split_by_mb(ocr_bytes, split_mb)
-                        st.write(f"**{len(parts)} part(s) created:**")
-                        for name, data in parts:
-                            size_mb = len(data) / (1024 * 1024)
-                            st.download_button(
-                                label=f"Download {name}  ({size_mb:.2f} MB)",
-                                data=data,
-                                file_name=f"{stem}_{name}",
-                                mime="application/pdf",
-                                key=f"dl_{name}",
-                                use_container_width=True,
-                            )
+                        zip_bytes = make_zip(stem, parts)
 
                 elif split_mode == "Split by page count":
                     parts = split_by_pages(ocr_bytes, split_pages)
-                    st.write(f"**{len(parts)} part(s) created:**")
-                    for name, data in parts:
-                        size_mb = len(data) / (1024 * 1024)
-                        st.download_button(
-                            label=f"Download {name}  ({size_mb:.2f} MB)",
-                            data=data,
-                            file_name=f"{stem}_{name}",
-                            mime="application/pdf",
-                            key=f"dl_{name}",
-                            use_container_width=True,
-                        )
+                    zip_bytes = make_zip(stem, parts)
+
+            # Only show the ZIP block when splitting actually happened
+            if split_mode != "No split" and (
+                split_mode == "Split by page count"
+                or (split_mode == "Split by file size (MB)" and len(ocr_bytes) / (1024 * 1024) > split_mb)
+            ):
+                total_zip_mb = len(zip_bytes) / (1024 * 1024)
+
+                # Summary table
+                rows = [
+                    f"| {i+1} | {name} | {len(data)/(1024*1024):.2f} MB |"
+                    for i, (name, data) in enumerate(parts)
+                ]
+                st.markdown(
+                    f"**{len(parts)} part(s) — {total_zip_mb:.2f} MB total:**\n\n"
+                    "| # | File | Size |\n|---|---|---|\n" + "\n".join(rows)
+                )
+
+                st.download_button(
+                    label=f"⬇ Download All {len(parts)} Parts as ZIP",
+                    data=zip_bytes,
+                    file_name=f"{stem}_split_parts.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                    type="primary",
+                )
 
 else:
     st.info("Upload a scanned PDF above to get started.")
